@@ -215,13 +215,12 @@ GROUP BY "item"."order"
 
 >>> select((order, sum(order.items.price * order.items.quantity)) for order in Order if order.id == 123)
 
-SELECT "order"."id", (
-    SELECT coalesce(SUM(("orderitem-1"."price" * "orderitem-1"."quantity")), 0)
-    FROM "OrderItem" "orderitem-1"
-    WHERE "order"."id" = "orderitem-1"."order"
-    )
+SELECT "order"."id", coalesce(SUM(("orderitem-1"."price" * "orderitem-1"."quantity")), 0)
 FROM "Order" "order"
+  LEFT JOIN "OrderItem" "orderitem-1"
+    ON "order"."id" = "orderitem-1"."order"
 WHERE "order"."id" = 123
+GROUP BY "order"."id"
 
 >>> select((item.order, item.order.total_price, sum(item.price * item.quantity)) for item in OrderItem if item.order.total_price < sum(item.price * item.quantity))
 
@@ -272,14 +271,14 @@ FROM "Student" "s"
 GROUP BY "s"."group"
 HAVING MAX("s"."gpa") < 4
 
->>> select((s.group, avg(s.gpa)) for s in Student) .order_by(lambda: avg(s.gpa))
+>>> select((s.group, avg(s.gpa)) for s in Student).order_by(lambda: avg(s.gpa))
 
 SELECT "s"."group", AVG("s"."gpa")
 FROM "Student" "s"
 GROUP BY "s"."group"
 ORDER BY AVG("s"."gpa")
 
->>> select((s.group, avg(s.gpa)) for s in Student) .order_by(lambda: desc(avg(s.gpa)))
+>>> select((s.group, avg(s.gpa)) for s in Student).order_by(lambda: desc(avg(s.gpa)))
 
 SELECT "s"."group", AVG("s"."gpa")
 FROM "Student" "s"
@@ -338,5 +337,39 @@ SELECT "s"."ID", "s"."NAME", "s"."DOB", "s"."TEL", "s"."GPA", "s"."GROUP"
 FROM "STUDENT" "s"
 WHERE "s"."GROUP" = 1
 
+>>> select(c for c in Course if count(c.students) > 3)
 
+SELECT "c"."name", "c"."semester"
+FROM "Course" "c"
+  LEFT JOIN "Course_Student" "t-1"
+    ON "c"."name" = "t-1"."course_name" AND "c"."semester" = "t-1"."course_semester"
+GROUP BY "c"."name", "c"."semester"
+HAVING COUNT(DISTINCT "t-1"."student") > 3
 
+Oracle:
+
+SELECT "c"."NAME", "c"."SEMESTER"
+FROM "COURSE" "c"
+  LEFT JOIN "COURSE_STUDENT" "t-1"
+    ON "c"."NAME" = "t-1"."COURSE_NAME" AND "c"."SEMESTER" = "t-1"."COURSE_SEMESTER"
+GROUP BY "c"."NAME", "c"."SEMESTER"
+HAVING COUNT(DISTINCT "t-1"."STUDENT") > 3
+
+>>> select(s for s in Student if count(s.courses) > 3)
+
+SELECT "s"."id"
+FROM "Student" "s"
+  LEFT JOIN "Course_Student" "t-1"
+    ON "s"."id" = "t-1"."student"
+GROUP BY "s"."id"
+HAVING COUNT("t-1"."ROWID") > 3
+
+Oracle:
+
+SELECT "s"."ID", "s"."NAME", "s"."DOB", "s"."TEL", "s"."GPA", "s"."GROUP"
+FROM "STUDENT" "s"
+WHERE (
+    SELECT COUNT(*)
+    FROM "COURSE_STUDENT" "t-1"
+    WHERE "s"."ID" = "t-1"."STUDENT"
+    ) > 3
