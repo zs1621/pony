@@ -468,7 +468,7 @@ class Database(object):
     @cut_traceback
     def execute(database, sql, globals=None, locals=None):
         database._get_cache().flush()
-        return database._exec_raw_sql(sql, globals, locals, 2)
+        return database._exec_raw_sql(sql, globals, locals, frame_depth=3)
     def _exec_raw_sql(database, sql, globals, locals, frame_depth):
         sql = sql[:]  # sql = templating.plainstr(sql)
         if globals is None:
@@ -483,7 +483,7 @@ class Database(object):
     @cut_traceback
     def select(database, sql, globals=None, locals=None, frame_depth=0):
         if not select_re.match(sql): sql = 'select ' + sql
-        cursor = database._exec_raw_sql(sql, globals, locals, frame_depth + 2)
+        cursor = database._exec_raw_sql(sql, globals, locals, frame_depth + 3)
         max_fetch_count = options.MAX_FETCH_COUNT
         if max_fetch_count is not None:
             result = cursor.fetchmany(max_fetch_count)
@@ -501,7 +501,7 @@ class Database(object):
         return result
     @cut_traceback
     def get(database, sql, globals=None, locals=None):
-        rows = database.select(sql, globals, locals, 2)
+        rows = database.select(sql, globals, locals, frame_depth=3)
         if not rows: throw(RowNotFound)
         if len(rows) > 1: throw(MultipleRowsFound)
         row = rows[0]
@@ -509,7 +509,7 @@ class Database(object):
     @cut_traceback
     def exists(database, sql, globals=None, locals=None):
         if not select_re.match(sql): sql = 'select ' + sql
-        cursor = database._exec_raw_sql(sql, globals, locals, 2)
+        cursor = database._exec_raw_sql(sql, globals, locals, frame_depth=3)
         result = cursor.fetchone()
         return bool(result)
     @cut_traceback
@@ -1424,8 +1424,9 @@ class PrimaryKey(Required):
         return None
 
 class Collection(Attribute):
-    __slots__ = 'table', 'cached_load_sql', 'cached_add_m2m_sql', 'cached_remove_m2m_sql', 'wrapper_class', \
-                'symmetric', 'reverse_column', 'reverse_columns', 'nplus1_threshold'
+    __slots__ = 'table', 'wrapper_class', 'symmetric', 'reverse_column', 'reverse_columns', \
+                'nplus1_threshold', 'cached_load_sql', 'cached_add_m2m_sql', 'cached_remove_m2m_sql', \
+                'cached_count_sql', 'cached_empty_sql'
     def __init__(attr, py_type, *args, **kwargs):
         if attr.__class__ is Collection: throw(TypeError, "'Collection' is abstract type")
         table = kwargs.pop('table', None)  # TODO: rename table to link_table or m2m_table
@@ -1463,6 +1464,8 @@ class Collection(Attribute):
         attr.cached_load_sql = {}
         attr.cached_add_m2m_sql = None
         attr.cached_remove_m2m_sql = None
+        attr.cached_count_sql = None
+        attr.cached_empty_sql = None
     def _init_(attr, entity, name):
         Attribute._init_(attr, entity, name)
         if attr.is_unique: throw(TypeError,
@@ -1485,13 +1488,12 @@ class Collection(Attribute):
     def set(attr, obj, val, fromdb=False):
         assert False, 'Abstract method'
 
-EMPTY = ()
-
 class SetData(set):
-    __slots__ = 'is_fully_loaded', 'added', 'removed'
+    __slots__ = 'is_fully_loaded', 'added', 'removed', 'count'
     def __init__(setdata):
         setdata.is_fully_loaded = False
-        setdata.added = setdata.removed = EMPTY
+        setdata.added = setdata.removed = None
+        setdata.count = None
 
 def construct_criteria_list(alias, columns, converters, row_value_syntax, count=1, start=0):
     assert count > 0
@@ -1545,8 +1547,8 @@ class Set(Collection):
         return items
     def load(attr, obj, items=None):
         assert obj._status_ not in del_statuses
-        setdata = obj._vals_.get(attr.name, NOT_LOADED)
-        if setdata is NOT_LOADED: setdata = obj._vals_[attr.name] = SetData()
+        setdata = obj._vals_.get(attr.name)
+        if setdata is None: setdata = obj._vals_[attr.name] = SetData()
         elif setdata.is_fully_loaded: return setdata
         entity = attr.entity
         reverse = attr.reverse
@@ -1562,11 +1564,17 @@ class Set(Collection):
         nplus1_threshold = attr.nplus1_threshold
         prefetching = not attr.lazy and nplus1_threshold is not None and counter >= nplus1_threshold
 
-        if items and (attr.lazy or not setdata):
-            items_to_load = [ item for item in items
-                              if item not in setdata and item not in setdata.removed ]
-            if not items_to_load: return setdata
+        if items:
+            if not reverse.is_collection:
+                rname = reverse.name
+                items = set(item for item in items if rname not in item._vals_)
+            else:
+                items = set(items)
+                items -= setdata
+                if setdata.removed: items -= setdata.removed
+            if not items: return setdata
 
+        if items and (attr.lazy or not setdata):
             value_dict = dict(enumerate(items))
             if not reverse.is_collection:
                 sql, adapter, attr_offsets = rentity._construct_batchload_sql_(len(items))
@@ -1575,7 +1583,7 @@ class Set(Collection):
                 items = rentity._fetch_objects(cursor, attr_offsets)
                 return setdata
             
-            items_count = len(items_to_load)            
+            items_count = len(items)
             sql, adapter = attr.construct_sql_m2m(1, items_count)
             value_dict[items_count] = obj
             arguments = adapter(value_dict)
@@ -1593,8 +1601,8 @@ class Set(Collection):
             for obj2 in pk_index.itervalues():
                 if obj2 is obj: continue
                 if obj2._status_ in created_or_deleted_statuses: continue
-                setdata2 = obj2._vals_.get(attr.name, NOT_LOADED)
-                if setdata2 is NOT_LOADED: setdata2 = obj2._vals_[attr.name] = SetData()
+                setdata2 = obj2._vals_.get(attr.name)
+                if setdata2 is None: setdata2 = obj2._vals_[attr.name] = SetData()
                 elif setdata2.is_fully_loaded: continue
                 objects.append(obj2)
                 setdata_list.append(setdata2)
@@ -1622,20 +1630,22 @@ class Set(Collection):
                     items.add(item)
             else: d[obj] = set(imap(rentity._get_by_raw_pkval_, cursor.fetchall()))
             for obj2, items in d.iteritems():
-                setdata2 = obj2._vals_.get(attr.name, NOT_LOADED)
-                if setdata2 is NOT_LOADED: setdata2 = obj._vals_[attr.name] = SetData()
+                setdata2 = obj2._vals_.get(attr.name)
+                if setdata2 is None: setdata2 = obj._vals_[attr.name] = SetData()
                 else:
                     phantoms = setdata2 - items
-                    phantoms.difference_update(setdata2.added)
+                    if setdata2.added: phantoms -= setdata2.added
                     if phantoms: throw(UnrepeatableReadError,
                         'Phantom object %s disappeared from collection %s.%s'
                         % (safe_repr(phantoms.pop()), safe_repr(obj), attr.name))
                 items -= setdata2
-                items.difference_update(setdata2.removed)
+                if setdata2.removed: items -= setdata2.removed
                 setdata2 |= items
                 reverse.db_reverse_add(items, obj2)
 
-        for setdata2 in setdata_list: setdata2.is_fully_loaded = True
+        for setdata2 in setdata_list:
+            setdata2.is_fully_loaded = True
+            setdata2.count = len(setdata2)
         cache.collection_statistics[attr] = counter + 1
         return setdata
     def construct_sql_m2m(attr, batch_size=1, items_count=0):
@@ -1674,11 +1684,11 @@ class Set(Collection):
         return sql, adapter
     def copy(attr, obj):
         if obj._status_ in del_statuses: throw_object_was_deleted(obj)
-        setdata = obj._vals_.get(attr.name, NOT_LOADED)
-        if setdata is NOT_LOADED or not setdata.is_fully_loaded: setdata = attr.load(obj)
+        setdata = obj._vals_.get(attr.name)
+        if setdata is None or not setdata.is_fully_loaded: setdata = attr.load(obj)
         reverse = attr.reverse
         if not reverse.is_collection and reverse.pk_offset is None:
-            added = setdata.added
+            added = setdata.added or ()
             for item in setdata:
                 if item not in added: item._rbits_ |= item._bits_[reverse]
         return set(setdata)
@@ -1702,11 +1712,12 @@ class Set(Collection):
             new_items = attr.check(new_items, obj)
             reverse = attr.reverse
             if not reverse: throw(NotImplementedError)
-            setdata = obj._vals_.get(attr.name, NOT_LOADED)
-            if setdata is NOT_LOADED:
+            setdata = obj._vals_.get(attr.name)
+            if setdata is None:
                 if obj._status_ == 'created':
                     setdata = obj._vals_[attr.name] = SetData()
                     setdata.is_fully_loaded = True
+                    setdata.count = 0
                 else: setdata = attr.load(obj)
             elif not setdata.is_fully_loaded: setdata = attr.load(obj)
             if new_items == setdata: return
@@ -1725,16 +1736,17 @@ class Set(Collection):
                 raise
             setdata.clear()
             setdata |= new_items
+            if setdata.count is not None: setdata.count = len(new_items)
             added = setdata.added
             removed = setdata.removed
             if to_add:
                 if removed: (to_add, setdata.removed) = (to_add - removed, removed - to_add)
                 if added: added |= to_add
-                else: setdata.added = to_add  # added may be EMPTY
+                else: setdata.added = to_add  # added may be None
             if to_remove:
                 if added: (to_remove, setdata.added) = (to_remove - added, added - to_remove)
                 if removed: removed |= to_remove
-                else: setdata.removed = to_remove  # removed may be EMPTY
+                else: setdata.removed = to_remove  # removed may be None
             cache.modified = True
             cache.modified_collections.setdefault(attr, set()).add(obj)
         finally:
@@ -1746,61 +1758,60 @@ class Set(Collection):
         cache = item._cache_
         objects_with_modified_collections = cache.modified_collections.setdefault(attr, set())
         for obj in objects:
-            setdata = obj._vals_.get(attr.name, NOT_LOADED)
-            if setdata is NOT_LOADED:
-                setdata = obj._vals_[attr.name] = SetData()
-            if setdata.added is EMPTY: setdata.added = set()
-            elif item in setdata.added: raise AssertionError
-            in_setdata = item in setdata
-            in_removed = item in setdata.removed
+            setdata = obj._vals_.get(attr.name)
+            if setdata is None: setdata = obj._vals_[attr.name] = SetData()
+            else: assert item not in setdata
+            if setdata.added is None: setdata.added = set()
+            else: assert item not in setdata.added
+            in_removed = setdata.removed and item in setdata.removed
             was_modified_earlier = obj in objects_with_modified_collections
-            undo.append((obj, in_setdata, in_removed, was_modified_earlier))
-            if not in_setdata: setdata.add(item)
-            setdata.added.add(item)
+            undo.append((obj, in_removed, was_modified_earlier))
+            setdata.add(item)
+            if setdata.count is not None: setdata.count += 1
             if in_removed: setdata.removed.remove(item)
+            else: setdata.added.add(item)
             objects_with_modified_collections.add(obj)
         def undo_func():
-            for obj, in_setdata, in_removed, was_modified_earlier in undo:
+            for obj, in_removed, was_modified_earlier in undo:
                 setdata = obj._vals_[attr.name]
-                setdata.added.remove(item)
-                if not in_setdata: setdata.remove(item)
+                setdata.remove(item)
+                if setdata.count is not None: setdata.count -= 1
                 if in_removed: setdata.removed.add(item)
+                else: setdata.added.remove(item)
                 if not was_modified_earlier: objects_with_modified_collections.remove(obj)
         undo_funcs.append(undo_func)
     def db_reverse_add(attr, objects, item):
         for obj in objects:
-            setdata = obj._vals_.get(attr.name, NOT_LOADED)
-            if setdata is NOT_LOADED:
-                setdata = obj._vals_[attr.name] = SetData()
-            elif setdata.is_fully_loaded:
-                throw(UnrepeatableReadError, 'Phantom object %s appeared in collection %s.%s'
-                                             % (safe_repr(item), safe_repr(obj), attr.name))
+            setdata = obj._vals_.get(attr.name)
+            if setdata is None: setdata = obj._vals_[attr.name] = SetData()
+            elif setdata.is_fully_loaded: throw(UnrepeatableReadError,
+                'Phantom object %s appeared in collection %s.%s' % (safe_repr(item), safe_repr(obj), attr.name))
             setdata.add(item)
     def reverse_remove(attr, objects, item, undo_funcs):
         undo = []
         cache = item._cache_
         objects_with_modified_collections = cache.modified_collections.setdefault(attr, set())
         for obj in objects:
-            setdata = obj._vals_.get(attr.name, NOT_LOADED)
-            if setdata is NOT_LOADED:
-                setdata = obj._vals_[attr.name] = SetData()
-            if setdata.removed is EMPTY: setdata.removed = set()
-            elif item in setdata.removed: raise AssertionError
-            in_setdata = item in setdata
-            in_added = item in setdata.added
+            setdata = obj._vals_.get(attr.name)
+            assert setdata is not None
+            assert item in setdata
+            if setdata.removed is None: setdata.removed = set()
+            else: assert item not in setdata.removed
+            in_added = setdata.added and item in setdata.added
             was_modified_earlier = obj in objects_with_modified_collections
-            undo.append((obj, in_setdata, in_added, was_modified_earlier))
+            undo.append((obj, in_added, was_modified_earlier))
             objects_with_modified_collections.add(obj)
-            if in_setdata: setdata.remove(item)
+            setdata.remove(item)
+            if setdata.count is not None: setdata.count -= 1
             if in_added: setdata.added.remove(item)
-            if item._status_ not in ('created', 'cancelled'):
-                setdata.removed.add(item)
+            else: setdata.removed.add(item)
         def undo_func():
-            for obj, in_setdata, in_removed, was_modified_earlier in undo:
+            for obj, in_removed, was_modified_earlier in undo:
                 setdata = obj._vals_[attr.name]
+                setdata.add(item)
+                if setdata.count is not None: setdata.count += 1
                 if in_added: setdata.added.add(item)
-                if in_setdata: setdata.add(item)
-                setdata.removed.discard(item)
+                else: setdata.removed.remove(item)
                 if not was_modified_earlier: objects_with_modified_collections.remove(obj)
         undo_funcs.append(undo_func)
     def db_reverse_remove(attr, objects, item):
@@ -1896,9 +1907,10 @@ def unpickle_setwrapper(obj, attrname, items):
     attr = getattr(obj.__class__, attrname)
     wrapper_cls = attr.py_type._get_set_wrapper_subclass_()
     wrapper = wrapper_cls(obj, attr)
-    setdata = obj._vals_.get(attr.name, NOT_LOADED)
-    if setdata is NOT_LOADED: setdata = obj._vals_[attr.name] = SetData()
+    setdata = obj._vals_.get(attr.name)
+    if setdata is None: setdata = obj._vals_[attr.name] = SetData()
     setdata.is_fully_loaded = True
+    setdata.count = len(setdata)
     return wrapper
 
 class SetWrapper(object):
@@ -1928,19 +1940,98 @@ class SetWrapper(object):
         obj = wrapper._obj_
         if not obj._cache_.is_alive: throw_db_session_is_over(obj)
         if obj._status_ in del_statuses: throw_object_was_deleted(obj)
-        setdata = obj._vals_.get(attr.name, NOT_LOADED)
-        if setdata is NOT_LOADED: setdata = attr.load(obj)
+        setdata = obj._vals_.get(attr.name)
+        if setdata is None: setdata = attr.load(obj)
         if setdata: return True
         if not setdata.is_fully_loaded: setdata = attr.load(obj)
         return bool(setdata)
+    @cut_traceback
+    def is_empty(wrapper):
+        attr = wrapper._attr_
+        obj = wrapper._obj_
+        if not obj._cache_.is_alive: throw_db_session_is_over(obj)
+        if obj._status_ in del_statuses: throw_object_was_deleted(obj)
+        setdata = obj._vals_.get(attr.name)
+        if setdata is None: setdata = obj._vals_[attr.name] = SetData()
+        elif setdata.is_fully_loaded: return not setdata
+        elif setdata: return False
+        elif setdata.count is not None: return not setdata.count
+        entity = attr.entity
+        reverse = attr.reverse
+        rentity = reverse.entity
+        database = entity._database_
+        cached_sql = attr.cached_empty_sql
+        if cached_sql is None:
+            where_list = [ 'WHERE' ]
+            for i, (column, converter) in enumerate(zip(reverse.columns, reverse.converters)):
+                where_list.append([ 'EQ', [ 'COLUMN', None, column ], [ 'PARAM', i, converter ] ])
+            if not reverse.is_collection:
+                table_name = rentity._table_
+                select_list, attr_offsets = rentity._construct_select_clause_()
+            else:
+                table_name = attr.table
+                select_list = [ 'ALL' ] + [ [ 'COLUMN', None, column ] for column in attr.columns ]
+                attr_offsets = None
+            sql_ast = [ 'SELECT', select_list, [ 'FROM', [ None, 'TABLE', table_name ] ],
+                        where_list, [ 'LIMIT', [ 'VALUE', 1 ] ] ]
+            sql, adapter = database._ast2sql(sql_ast)
+            attr.cached_empty_sql = sql, adapter, attr_offsets
+        else: sql, adapter, attr_offsets = cached_sql
+        arguments = adapter(obj._get_raw_pkval_())
+        cursor = database._exec_sql(sql, arguments)
+        if reverse.is_collection:
+            row = cursor.fetchone()
+            if row is not None:
+                loaded_item = rentity._get_by_raw_pkval_(row)
+                setdata.add(loaded_item)
+                reverse.db_reverse_add((loaded_item,), obj)
+        else: rentity._fetch_objects(cursor, attr_offsets)
+        if setdata: return False
+        setdata.is_fully_loaded = True
+        setdata.count = 0
+        return True
     @cut_traceback
     def __len__(wrapper):
         attr = wrapper._attr_
         obj = wrapper._obj_
         if not obj._cache_.is_alive: throw_db_session_is_over(obj)
-        setdata = obj._vals_.get(attr.name, NOT_LOADED)
-        if setdata is NOT_LOADED or not setdata.is_fully_loaded: setdata = attr.load(obj)
+        if obj._status_ in del_statuses: throw_object_was_deleted(obj)
+        setdata = obj._vals_.get(attr.name)
+        if setdata is None or not setdata.is_fully_loaded: setdata = attr.load(obj)
         return len(setdata)
+    @cut_traceback
+    def count(wrapper):
+        attr = wrapper._attr_
+        obj = wrapper._obj_
+        cache = obj._cache_
+        if not cache.is_alive: throw_db_session_is_over(obj)
+        if obj._status_ in del_statuses: throw_object_was_deleted(obj)
+        setdata = obj._vals_.get(attr.name)
+        if setdata is None: setdata = obj._vals_[attr.name] = SetData()
+        elif setdata.count is not None: return setdata.count
+        entity = attr.entity
+        reverse = attr.reverse
+        database = entity._database_
+        cached_sql = attr.cached_count_sql
+        if cached_sql is None:
+            where_list = [ 'WHERE' ]
+            for i, (column, converter) in enumerate(zip(reverse.columns, reverse.converters)):
+                where_list.append([ 'EQ', [ 'COLUMN', None, column ], [ 'PARAM', i, converter ] ])
+            if not reverse.is_collection: table_name = reverse.entity._table_
+            else: table_name = attr.table
+            sql_ast = [ 'SELECT', [ 'AGGREGATES', [ 'COUNT', 'ALL' ] ],
+                                  [ 'FROM', [ None, 'TABLE', table_name ] ], where_list ]
+            sql, adapter = database._ast2sql(sql_ast)
+            attr.cached_count_sql = sql, adapter
+        else: sql, adapter = cached_sql
+        arguments = adapter(obj._get_raw_pkval_())
+        cache.noflush += 1
+        try: cursor = database._exec_sql(sql, arguments)
+        finally: cache.noflush -= 1
+        setdata.count = cursor.fetchone()[0]
+        if setdata.added: setdata.count += len(setdata.added)
+        if setdata.removed: setdata.count -= len(setdata.removed)
+        return setdata.count
     @cut_traceback
     def __iter__(wrapper):
         return iter(wrapper.copy())
@@ -1978,8 +2069,8 @@ class SetWrapper(object):
             if wbits is not None and not wbits & bit: item._rbits_ |= bit
 
             return obj is obj2
-        setdata = obj._vals_.get(attr.name, NOT_LOADED)
-        if setdata is not NOT_LOADED:
+        setdata = obj._vals_.get(attr.name)
+        if setdata is not None:
             if item in setdata: return True
             if setdata.is_fully_loaded: return False
         setdata = attr.load(obj, (item,))
@@ -2009,9 +2100,9 @@ class SetWrapper(object):
             if not reverse: throw(NotImplementedError)
             new_items = attr.check(new_items, obj)
             if not new_items: return
-            setdata = obj._vals_.get(attr.name, NOT_LOADED)
-            if setdata is not NOT_LOADED: new_items -= setdata
-            if setdata is NOT_LOADED or not setdata.is_fully_loaded:
+            setdata = obj._vals_.get(attr.name)
+            if setdata is not None: new_items -= setdata
+            if setdata is None or not setdata.is_fully_loaded:
                 setdata = attr.load(obj, new_items)
             new_items -= setdata
             undo_funcs = []
@@ -2023,11 +2114,12 @@ class SetWrapper(object):
                 for undo_func in reversed(undo_funcs): undo_func()
                 raise
             setdata |= new_items
+            if setdata.count is not None: setdata.count += len(new_items)
             added = setdata.added
             removed = setdata.removed
             if removed: (new_items, setdata.removed) = (new_items-removed, removed-new_items)
             if added: added |= new_items
-            else: setdata.added = new_items  # added may be EMPTY
+            else: setdata.added = new_items  # added may be None
 
             cache.modified = True
             cache.modified_collections.setdefault(attr, set()).add(obj)
@@ -2049,11 +2141,11 @@ class SetWrapper(object):
             reverse = attr.reverse
             if not reverse: throw(NotImplementedError)
             items = attr.check(items, obj)
-            setdata = obj._vals_.get(attr.name, NOT_LOADED)
-            if setdata is not NOT_LOADED and setdata.removed:
+            setdata = obj._vals_.get(attr.name)
+            if setdata is not None and setdata.removed:
                 items -= setdata.removed
             if not items: return
-            if setdata is NOT_LOADED or not setdata.is_fully_loaded:
+            if setdata is None or not setdata.is_fully_loaded:
                 setdata = attr.load(obj, items)
             items &= setdata
             undo_funcs = []
@@ -2065,11 +2157,12 @@ class SetWrapper(object):
                 for undo_func in reversed(undo_funcs): undo_func()
                 raise
             setdata -= items
+            if setdata.count is not None: setdata.count -= len(items)
             added = setdata.added
             removed = setdata.removed
             if added: (items, setdata.added) = (items - added, added - items)
             if removed: removed |= items
-            else: setdata.removed = items  # removed may be EMPTY
+            else: setdata.removed = items  # removed may be None
 
             cache.modified = True
             cache.modified_collections.setdefault(attr, set()).add(obj)
@@ -2478,20 +2571,20 @@ class EntityMeta(type):
         return objects[0]
     @cut_traceback
     def exists(entity, *args, **kwargs):
-        if args: return entity._query_from_args_(3, args, kwargs).exists()
+        if args: return entity._query_from_args_(args, kwargs, frame_depth=3).exists()
         try: objects = entity._find_(1, kwargs)
         except MultipleObjectsFoundError: return True
         return bool(objects)
     @cut_traceback
     def get(entity, *args, **kwargs):
-        if args: return entity._query_from_args_(3, args, kwargs).get()
+        if args: return entity._query_from_args_(args, kwargs, frame_depth=3).get()
         objects = entity._find_(1, kwargs)  # can throw MultipleObjectsFoundError
         if not objects: return None
         assert len(objects) == 1
         return objects[0]
     @cut_traceback
     def get_by_sql(entity, sql, globals=None, locals=None):
-        objects = entity._find_by_sql_(1, sql, globals, locals, 2)  # can throw MultipleObjectsFoundError
+        objects = entity._find_by_sql_(1, sql, globals, locals, frame_depth=3)  # can throw MultipleObjectsFoundError
         if not objects: return None
         assert len(objects) == 1
         return objects[0]
@@ -2507,7 +2600,7 @@ class EntityMeta(type):
         return entity._query_from_lambda_(func, globals, locals)
     @cut_traceback
     def select_by_sql(entity, sql, globals=None, locals=None):
-        return entity._find_by_sql_(None, sql, globals, locals, 2)
+        return entity._find_by_sql_(None, sql, globals, locals, frame_depth=3)
     @cut_traceback
     def order_by(entity, *args):
         query = Query(entity._default_iter_name_, entity._default_genexpr_, {}, { '.0' : entity })
@@ -2771,7 +2864,7 @@ class EntityMeta(type):
                 for obj in result:
                     if obj not in batch: throw(UnrepeatableReadError,
                                                'Phantom object %s disappeared' % safe_repr(obj))
-    def _query_from_args_(entity, frame_depth, args, kwargs):
+    def _query_from_args_(entity, args, kwargs, frame_depth):
         if len(args) > 1: throw(TypeError, 'Only one positional argument expected')
         if kwargs: throw(TypeError, 'If positional argument presented, no keyword arguments expected')
         first_arg = args[0]
@@ -3754,16 +3847,23 @@ class Cache(object):
                                     key=lambda (attr, objects): (attr.entity.__name__, attr.name)):
             if not isinstance(attr, Set): throw(NotImplementedError)
             reverse = attr.reverse
-            if not reverse.is_collection: continue
+            if not reverse.is_collection:
+                for obj in objects:
+                    setdata = obj._vals_[attr.name]
+                    setdata.added = setdata.removed = None
+                continue
+
             if not isinstance(reverse, Set): throw(NotImplementedError)
             if reverse in modified_m2m: continue
             added, removed = modified_m2m.setdefault(attr, (set(), set()))
             for obj in objects:
                 setdata = obj._vals_[attr.name]
-                for obj2 in setdata.added: added.add((obj, obj2))
-                for obj2 in setdata.removed: removed.add((obj, obj2))
+                if setdata.added:
+                    for obj2 in setdata.added: added.add((obj, obj2))
+                if setdata.removed:
+                    for obj2 in setdata.removed: removed.add((obj, obj2))
                 if obj._status_ == 'deleted': del obj._vals_[attr.name]
-                else: setdata.added = setdata.removed = EMPTY
+                else: setdata.added = setdata.removed = None
         cache.modified_collections.clear()
         return modified_m2m
     def update_simple_index(cache, obj, attr, old_val, new_val, undo):
@@ -4229,6 +4329,11 @@ class Query(object):
     def limit(query, limit, offset=None):
         start = offset or 0
         stop = start + limit
+        return query[start:stop]
+    @cut_traceback
+    def page(query, pagenum, pagesize=10):
+        start = (pagenum - 1) * pagesize
+        stop = pagenum * pagesize
         return query[start:stop]
     def _aggregate(query, aggr_func_name):
         translator = query._translator
