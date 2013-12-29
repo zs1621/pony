@@ -153,6 +153,8 @@ class OraBuilder(sqlbuilding.SQLBuilder):
         else: return 'LIMIT ', builder(limit), ' OFFSET ', builder(offset), '\n'
     def DATE(builder, expr):
         return 'TRUNC(', builder(expr), ')'
+    def RANDOM(builder):
+        return 'dbms_random.value'
 
 class OraBoolConverter(dbapiprovider.BoolConverter):
     def sql2py(converter, val):
@@ -235,6 +237,19 @@ class OraProvider(DBAPIProvider):
 
     name_before_table = 'owner'
 
+    converter_classes = [
+        (bool, OraBoolConverter),
+        (unicode, OraUnicodeConverter),
+        (str, OraStrConverter),
+        ((int, long), OraIntConverter),
+        (float, OraRealConverter),
+        (Decimal, OraDecimalConverter),
+        (buffer, OraBlobConverter),
+        (datetime, OraDatetimeConverter),
+        (date, OraDateConverter),
+        (UUID, OraUuidConverter),
+    ]
+
     def inspect_connection(provider, connection):
         cursor = connection.cursor()
         cursor.execute('SELECT version FROM product_component_version '
@@ -270,19 +285,6 @@ class OraProvider(DBAPIProvider):
                 return var.getvalue()
             if arguments is None: cursor.execute(sql)
             else: cursor.execute(sql, arguments)
-
-    converter_classes = [
-        (bool, OraBoolConverter),
-        (unicode, OraUnicodeConverter),
-        (str, OraStrConverter),
-        ((int, long), OraIntConverter),
-        (float, OraRealConverter),
-        (Decimal, OraDecimalConverter),
-        (buffer, OraBlobConverter),
-        (datetime, OraDatetimeConverter),
-        (date, OraDateConverter),
-        (UUID, OraUuidConverter),
-    ]
 
     def get_pool(provider, *args, **kwargs):
         user = password = dsn = None
